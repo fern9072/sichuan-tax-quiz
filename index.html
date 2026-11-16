@@ -1180,5 +1180,281 @@ ${e}
   </head>
   <body>
     <div id="root"></div>
-  </body>
+  <script>
+/* ===================== 跨设备同步模块（独立注入，不影响原应用） ===================== */
+(function () {
+  'use strict';
+  if (window.__taxQuizSyncLoaded) return;
+  window.__taxQuizSyncLoaded = true;
+
+  var TOKEN_KEY = 'tax_quiz_sync_token';
+  var GIST_ID_KEY = 'tax_quiz_sync_gist_id';
+  var GIST_FILENAME = 'tax-quiz-sync.json';
+  var GIST_DESC = '税务刷题同步数据（私密）';
+  var GIST_API = 'https://api.github.com/gists';
+  var SYNC_KEYS = ['tax_quiz_answers', 'tax_quiz_bookmarks', 'tax_quiz_bookmark_tags',
+    'tax_quiz_edited_options', 'tax_quiz_filled_options', 'tax_quiz_notes'];
+
+  function readKey(k) {
+    try { return JSON.parse(localStorage.getItem(k) || 'null') || {}; } catch (e) { return {}; }
+  }
+  function collect() {
+    return {
+      answers: readKey('tax_quiz_answers'),
+      bookmarks: readKey('tax_quiz_bookmarks'),
+      bookmarkTags: readKey('tax_quiz_bookmark_tags'),
+      editedOptions: readKey('tax_quiz_edited_options'),
+      filledOptions: readKey('tax_quiz_filled_options'),
+      notes: readKey('tax_quiz_notes'),
+      lastSync: Date.now(),
+      appVersion: 'sichuan-88banks'
+    };
+  }
+  function isSyncData(o) {
+    return o && typeof o === 'object' && ('answers' in o) && ('bookmarks' in o);
+  }
+  function apply(d) {
+    localStorage.setItem('tax_quiz_answers', JSON.stringify(d.answers || {}));
+    localStorage.setItem('tax_quiz_bookmarks', JSON.stringify(d.bookmarks || {}));
+    localStorage.setItem('tax_quiz_bookmark_tags', JSON.stringify(d.bookmarkTags || {}));
+    localStorage.setItem('tax_quiz_edited_options', JSON.stringify(d.editedOptions || {}));
+    localStorage.setItem('tax_quiz_filled_options', JSON.stringify(d.filledOptions || {}));
+    localStorage.setItem('tax_quiz_notes', JSON.stringify(d.notes || {}));
+  }
+  function merge(local, remote) {
+    var ans = {};
+    var banks = {}, i;
+    for (i in local.answers) banks[i] = 1;
+    for (i in remote.answers) banks[i] = 1;
+    for (i in banks) ans[i] = Object.assign({}, local.answers[i] || {}, remote.answers[i] || {});
+    var bms = {};
+    var bmBanks = {}, j;
+    for (j in local.bookmarks) bmBanks[j] = 1;
+    for (j in remote.bookmarks) bmBanks[j] = 1;
+    for (j in bmBanks) {
+      var set = {};
+      (local.bookmarks[j] || []).forEach(function (x) { set[x] = 1; });
+      (remote.bookmarks[j] || []).forEach(function (x) { set[x] = 1; });
+      bms[j] = Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
+    }
+    function flat(a, b) { return Object.assign({}, a, b); }
+    return {
+      answers: ans, bookmarks: bms,
+      bookmarkTags: flat(local.bookmarkTags, remote.bookmarkTags),
+      editedOptions: flat(local.editedOptions, remote.editedOptions),
+      filledOptions: flat(local.filledOptions, remote.filledOptions),
+      notes: flat(local.notes, remote.notes),
+      lastSync: Date.now(), appVersion: 'sichuan-88banks'
+    };
+  }
+  function describe(d) {
+    var a = 0, b = 0, n = 0, k;
+    for (k in d.answers) a += Object.keys(d.answers[k] || {}).length;
+    for (k in d.bookmarks) b += (d.bookmarks[k] || []).length;
+    for (k in d.notes) n++;
+    return a + ' 条答题、' + b + ' 个收藏、' + n + ' 条笔记';
+  }
+  function headers() {
+    var t = localStorage.getItem(TOKEN_KEY) || '';
+    if (!t) throw new Error('未配置 GitHub Token');
+    return { 'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json' };
+  }
+  function ensureGist() {
+    var id = localStorage.getItem(GIST_ID_KEY) || '';
+    var chain = Promise.resolve(id);
+    return chain.then(function (gid) {
+      if (gid) {
+        return fetch(GIST_API + '/' + gid, { headers: headers() }).then(function (r) {
+          if (r.ok) return gid;
+          if (r.status === 404) { localStorage.removeItem(GIST_ID_KEY); return ''; }
+          if (r.status === 401) throw new Error('Token 无效或已过期');
+          throw new Error('GitHub API 错误 (' + r.status + ')');
+        });
+      }
+      return '';
+    }).then(function (gid) {
+      if (gid) return gid;
+      return fetch(GIST_API + '?per_page=100', { headers: headers() }).then(function (r) {
+        if (r.status === 401) throw new Error('Token 无效或已过期');
+        if (!r.ok) throw new Error('GitHub API 错误 (' + r.status + ')');
+        return r.json();
+      }).then(function (list) {
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].description === GIST_DESC && !list[i].public) {
+            localStorage.setItem(GIST_ID_KEY, list[i].id);
+            return list[i].id;
+          }
+        }
+        return fetch(GIST_API, {
+          method: 'POST', headers: headers(),
+          body: JSON.stringify({ description: GIST_DESC, public: false, files: (function(){var f={};f[GIST_FILENAME]={content:JSON.stringify(collect())};return f;})() })
+        }).then(function (r) {
+          if (!r.ok) throw new Error('创建 Gist 失败 (' + r.status + ')');
+          return r.json();
+        }).then(function (g) {
+          localStorage.setItem(GIST_ID_KEY, g.id);
+          return g.id;
+        });
+      });
+    });
+  }
+
+  /* ---------- UI ---------- */
+  var css = document.createElement('style');
+  css.textContent = [
+    '#tqs-fab{position:fixed;right:14px;bottom:76px;z-index:9999;width:44px;height:44px;border-radius:50%;',
+    'background:#4f46e5;color:#fff;border:none;box-shadow:0 2px 8px rgba(0,0,0,.25);font-size:17px;cursor:pointer;}',
+    '#tqs-panel{position:fixed;right:10px;bottom:126px;z-index:10000;width:300px;max-width:calc(100vw - 20px);',
+    'background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.2);padding:14px;font-size:13px;',
+    'font-family:-apple-system,sans-serif;display:none;}',
+    '#tqs-panel h3{margin:0 0 8px;font-size:15px;display:flex;justify-content:space-between;align-items:center;}',
+    '#tqs-panel input{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:6px;padding:6px 8px;font-size:12px;margin-bottom:6px;}',
+    '#tqs-panel button.tqs-act{width:100%;border:none;border-radius:6px;padding:8px;font-size:13px;cursor:pointer;margin-bottom:6px;}',
+    '.tqs-dl{background:#4f46e5;color:#fff}.tqs-up{background:#059669;color:#fff}',
+    '.tqs-file{background:#fff;color:#374151;border:1px solid #d1d5db!important}',
+    '#tqs-msg{border-radius:6px;padding:6px 8px;font-size:12px;margin-top:4px;display:none;}',
+    '.tqs-ok{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}',
+    '.tqs-err{background:#fef2f2;color:#991b1b;border:1px solid #fecaca}',
+    '#tqs-tip{font-size:10px;color:#9ca3af;margin-top:6px;line-height:1.5;}'
+  ].join('');
+  document.head.appendChild(css);
+
+  var fab = document.createElement('button');
+  fab.id = 'tqs-fab';
+  fab.title = '跨设备同步做题记录';
+  fab.textContent = '⇅';
+
+  var panel = document.createElement('div');
+  panel.id = 'tqs-panel';
+  panel.innerHTML =
+    '<h3>跨设备同步 <span id="tqs-close" style="cursor:pointer;color:#9ca3af;font-weight:normal;">×</span></h3>' +
+    '<input id="tqs-token" type="password" placeholder="GitHub Token（需 gist 权限）">' +
+    '<input id="tqs-gist" type="text" placeholder="Gist ID（留空自动查找/创建）">' +
+    '<button class="tqs-act tqs-dl" id="tqs-download">↓ 从云端合并</button>' +
+    '<button class="tqs-act tqs-up" id="tqs-upload">↑ 上传到云端</button>' +
+    '<button class="tqs-act tqs-file" id="tqs-export">导出为文件</button>' +
+    '<button class="tqs-act tqs-file" id="tqs-import">从文件导入</button>' +
+    '<input id="tqs-filein" type="file" accept=".json" style="display:none">' +
+    '<div id="tqs-msg"></div>' +
+    '<div id="tqs-tip">记录与本地版刷题应用互通。合并规则：取并集，同题冲突以云端为准。配置仅存本机。</div>';
+
+  function show(msg, isErr) {
+    var el = document.getElementById('tqs-msg');
+    el.textContent = msg;
+    el.className = isErr ? 'tqs-err' : 'tqs-ok';
+    el.style.display = 'block';
+  }
+  function busyMsg(msg) { show(msg, false); }
+
+  fab.addEventListener('click', function () {
+    var p = document.getElementById('tqs-panel');
+    var open = p.style.display === 'block';
+    p.style.display = open ? 'none' : 'block';
+    if (!open) {
+      document.getElementById('tqs-token').value = localStorage.getItem(TOKEN_KEY) || '';
+      document.getElementById('tqs-gist').value = localStorage.getItem(GIST_ID_KEY) || '';
+      document.getElementById('tqs-msg').style.display = 'none';
+    }
+  });
+
+  panel.addEventListener('click', function (e) {
+    var id = e.target.id;
+
+    if (id === 'tqs-close') { panel.style.display = 'none'; return; }
+
+    if (id === 'tqs-download' || id === 'tqs-upload') {
+      localStorage.setItem(TOKEN_KEY, document.getElementById('tqs-token').value.trim());
+      var gid = document.getElementById('tqs-gist').value.trim();
+      if (gid) localStorage.setItem(GIST_ID_KEY, gid);
+      if (!localStorage.getItem(TOKEN_KEY)) { show('请先填写 GitHub Token', true); return; }
+      busyMsg(id === 'tqs-download' ? '正在从云端下载并合并...' : '正在上传到云端...');
+      var task;
+      if (id === 'tqs-download') {
+        task = ensureGist().then(function (gistId) {
+          return fetch(GIST_API + '/' + gistId, { headers: headers() });
+        }).then(function (r) {
+          if (r.status === 401) throw new Error('Token 无效或已过期');
+          if (!r.ok) throw new Error('下载失败 (' + r.status + ')');
+          return r.json();
+        }).then(function (g) {
+          var f = g.files && g.files[GIST_FILENAME];
+          if (!f) throw new Error('云端没有同步数据');
+          var remote = JSON.parse(f.content);
+          if (!isSyncData(remote)) throw new Error('云端数据格式无法识别');
+          var m = merge(collect(), remote);
+          apply(m);
+          return '合并完成！' + describe(m) + '，页面即将刷新';
+        }).then(function (msg) {
+          show(msg, false);
+          setTimeout(function () { location.reload(); }, 1200);
+          return null;
+        });
+      } else {
+        task = ensureGist().then(function (gistId) {
+          var data = collect();
+          return fetch(GIST_API + '/' + gistId, {
+            method: 'PATCH', headers: headers(),
+            body: JSON.stringify({ files: (function(){var f={};f[GIST_FILENAME]={content:JSON.stringify(data)};return f;})() })
+          }).then(function (r) {
+            if (r.status === 401) throw new Error('Token 无效或已过期');
+            if (!r.ok) throw new Error('上传失败 (' + r.status + ')');
+            return '上传成功！' + describe(data);
+          });
+        });
+      }
+      task.catch(function (err) { show(err.message || '操作失败，请检查网络', true); });
+      return;
+    }
+
+    if (id === 'tqs-export') {
+      var blob = new Blob([JSON.stringify(collect(), null, 2)], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = '税务刷题记录_' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+      show('已导出，可通过 AirDrop / 微信传输到其他设备', false);
+      return;
+    }
+
+    if (id === 'tqs-import') {
+      document.getElementById('tqs-filein').click();
+      return;
+    }
+  });
+
+  // 文件导入（change 事件需绑定在 input 上）
+  panel.addEventListener('change', function (e) {
+    if (e.target.id !== 'tqs-filein') return;
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var remote = JSON.parse(reader.result);
+        if (!isSyncData(remote)) throw new Error('文件格式无法识别');
+        var m = merge(collect(), remote);
+        apply(m);
+        show('导入成功！' + describe(m) + '，页面即将刷新', false);
+        setTimeout(function () { location.reload(); }, 1200);
+      } catch (err) {
+        show(err.message || '文件解析失败', true);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  });
+
+  function mount() {
+    document.body.appendChild(fab);
+    document.body.appendChild(panel);
+  }
+  if (document.body) mount();
+  else document.addEventListener('DOMContentLoaded', mount);
+})();
+</script>
+
+</body>
 </html>
